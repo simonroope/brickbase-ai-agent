@@ -36,7 +36,6 @@
  *   AGENT_PRIVATE_KEY   Investor wallet private key (0x-prefixed)
  *   MCP_URL             Platform MCP URL (optional; can be provided during criteria discovery)
  *   RPC_URL             Ethereum RPC (default: http://localhost:8545)
- *   INVESTOR_NAME       Report display name (default: Investor)
  *   REPORT_DIR          Output directory (default: ./reports)
  * ============================================================
  */
@@ -89,16 +88,24 @@ interface DiscoveredCapabilities {
 }
 
 interface AssetDetail {
-  id?: number;
+  assetId?: number;
   name: string;
   [key: string]: unknown;
+}
+
+function getAssetId(asset: Record<string, unknown>): number | undefined {
+  const assetId = asset.assetId;
+  if (assetId == null) return undefined;
+  const n = Number(assetId);
+  return Number.isNaN(n) ? undefined : n;
 }
 
 function assetDisplayName(asset: AssetDetail): string {
   const a = asset as Record<string, unknown>;
   const name = a.name ?? (a.metadata as Record<string, unknown> | undefined)?.name;
   if (typeof name === "string" && name) return name;
-  return a.id != null ? `Asset ${a.id}` : "Unknown Asset";
+  const assetId = getAssetId(a);
+  return assetId != null ? `Asset ${assetId}` : "Unknown Asset";
 }
 
 interface EvaluationResult {
@@ -121,7 +128,6 @@ interface AssetDecision {
 }
 
 interface AgentReport {
-  investorName: string;
   walletAddress: string;
   timestamp: string;
   criteria: InvestmentCriteria;
@@ -139,6 +145,9 @@ interface AgentReport {
 
 // ─── Config ───────────────────────────────────────────────────────────────────
 
+/** USDC and share prices use 6 decimals on-chain */
+const USDC_DECIMALS = 6;
+
 const CONFIG = {
   gemini: {
     model: process.env.GEMINI_MODEL ?? "gemini-2.0-flash",
@@ -152,7 +161,6 @@ const CONFIG = {
     privateKey: process.env.AGENT_PRIVATE_KEY ?? "",
     rpcUrl: process.env.RPC_URL ?? "http://localhost:8545",
   },
-  investorName: process.env.INVESTOR_NAME ?? "Investor",
   reportDir: process.env.REPORT_DIR ?? "./reports",
 };
 
@@ -325,7 +333,7 @@ Return JSON with the exact names/URIs to use. Infer parameter names from inputSc
 {
   "fetchListTool": "<tool name that fetches list of assets>",
   "fetchDetailTool": "<tool name that fetches one asset by ID>",
-  "detailIdParam": "<parameter name for asset ID, e.g. ID>",
+  "detailIdParam": "<parameter name for asset ID, e.g. assetId>",
   "purchaseTool": "<tool name that prepares purchase transactions>",
   "purchaseAssetParam": "<parameter name for asset ID>",
   "purchaseAmountParam": "<parameter name for share amount>",
@@ -362,12 +370,15 @@ async function signAndBroadcast(
 ): Promise<string[]> {
   const hashes: string[] = [];
   for (const [i, p] of payloads.entries()) {
+    await sleep(2000); // allow nonce to propagate on automining chains
+    const nonce = await signer.getNonce("pending");
     log("INFO", `  Signing tx ${i + 1}/${payloads.length}  ->  ${p.to}`);
     const tx = await signer.sendTransaction({
       to: p.to,
       data: p.data,
       value: p.value ? BigInt(p.value) : 0n,
       gasLimit: 400_000,
+      nonce,
     });
     log("INFO", `  Submitted: ${tx.hash}`);
     const receipt = await tx.wait();
@@ -477,29 +488,57 @@ async function discoverCriteria(
 
 // ─── Phase 2 — Fetch Assets (discovery-based) ──────────────────────────────────
 
+/** Convert on-chain e6 value (string or number) to human-readable USDC */
+function fromUsdcUnits(raw: unknown): number {
+  if (raw == null) return 0;
+  const s = String(raw).trim();
+  if (!s) return 0;
+  const n = parseFloat(s);
+  return Number.isNaN(n) ? 0 : n / 10 ** USDC_DECIMALS;
+}
+
+/** Normalize asset for evaluation: add human-readable price/value fields (USDC) */
+function normalizeAssetForEvaluation(asset: Record<string, unknown>): Record<string, unknown> {
+  const normalized = { ...asset };
+  const sharePrice = asset.sharePrice ?? asset.pricePerShare;
+  normalized.pricePerShareUsdc = fromUsdcUnits(sharePrice);
+  normalized.capitalValueUsdc = fromUsdcUnits(asset.capitalValue);
+  normalized.incomeValueUsdc = fromUsdcUnits(asset.incomeValue);
+  normalized.totalSupplyUsdc = fromUsdcUnits(asset.totalSupply);
+  normalized.availableSupplyUsdc = fromUsdcUnits(asset.availableSupply);
+  return normalized;
+}
+
+function extractAssetList(list: unknown): unknown[] {
+  if (Array.isArray(list)) return list;
+  if (list && typeof list === "object") {
+    const obj = list as Record<string, unknown>;
+    for (const key of ["assets", "data", "items", "results"]) {
+      const val = obj[key];
+      if (Array.isArray(val)) return val;
+    }
+  }
+  return [list];
+}
+
 async function fetchAllAssets(
   client: Client,
   caps: DiscoveredCapabilities
 ): Promise<AssetDetail[]> {
   log("STEP", "=== Phase 2: Fetching Assets ===");
 
-  const list = await mcpTool<AssetDetail[]>(
-    client,
-    caps.fetchListTool,
-    {}
-  );
-  const items = Array.isArray(list) ? list : [list];
+  const raw = await mcpTool<unknown>(client, caps.fetchListTool, {});
+  const items = extractAssetList(raw);
   log("INFO", `${items.length} assets found`);
 
   const details: AssetDetail[] = [];
   for (const asset of items) {
-    const id = (asset as Record<string, unknown>).id;
-    if (id == null) {
-      log("WARN", `  Skipping item with no id: ${JSON.stringify(asset).slice(0, 80)}...`);
+    const idNumber = getAssetId(asset as Record<string, unknown>);
+    if (idNumber == null) {
+      log("WARN", `  Skipping item with no assetId: ${JSON.stringify(asset).slice(0, 80)}...`);
       details.push(asset as AssetDetail);
       continue;
     }
-    const idNumber = Number(id);
     try {
       const detail = await mcpTool<AssetDetail>(
         client,
@@ -522,6 +561,8 @@ async function fetchAllAssets(
 const EVALUATOR_SYSTEM = `
 You are a strict investment evaluator for tokenised real estate.
 Evaluate assets against the investor's criteria. Return ONLY valid JSON.
+Use the *_Usdc fields for comparisons (pricePerShareUsdc, capitalValueUsdc, incomeValueUsdc).
+These are human-readable USDC amounts. Compare pricePerShareUsdc to maxPricePerShareUsdc.
 Cite specific numeric values in your reasoning.
 `.trim();
 
@@ -531,6 +572,7 @@ async function evaluateAsset(
   criteria: InvestmentCriteria,
   context: Record<string, unknown>
 ): Promise<EvaluationResult> {
+  const normalized = normalizeAssetForEvaluation(asset as Record<string, unknown>);
   const prompt = `
 Evaluate this asset against the investor's criteria.
 
@@ -540,8 +582,8 @@ ${JSON.stringify(criteria, null, 2)}
 CONTEXT:
 ${JSON.stringify(context, null, 2)}
 
-ASSET DATA:
-${JSON.stringify(asset, null, 2)}
+ASSET DATA (pricePerShareUsdc, capitalValueUsdc, incomeValueUsdc are human-readable USDC):
+${JSON.stringify(normalized, null, 2)}
 
 Return JSON:
 {
@@ -565,12 +607,12 @@ async function executePurchase(
   caps: DiscoveredCapabilities
 ): Promise<{ txHashes: string[]; error?: string }> {
   try {
-    const id = (asset as Record<string, unknown>).id;
-    if (id == null) throw new Error(`Asset has no id: ${JSON.stringify(asset).slice(0, 100)}`);
+    const id = getAssetId(asset as Record<string, unknown>);
+    if (id == null) throw new Error(`Asset has no assetId: ${JSON.stringify(asset).slice(0, 100)}`);
     const payload = await mcpTool<{
       transactions?: Array<{ to: string; data: string; value?: string }>;
     }>(client, caps.purchaseTool, {
-      [caps.purchaseAssetParam]: Number(id),
+      [caps.purchaseAssetParam]: id,
       [caps.purchaseAmountParam]: String(shareCount),
     });
 
@@ -592,11 +634,10 @@ async function executePurchase(
 // ─── Phase 5 — Report ───────────────────────────────────────────────────────────
 
 function buildMarkdownReport(report: AgentReport): string {
-  const { investorName, walletAddress, timestamp, criteria, decisions, summary } = report;
+  const { walletAddress, timestamp, criteria, decisions, summary } = report;
 
   let md = "# RWA Investment Report\n\n---\n\n";
   md += "| | |\n|---|---|\n";
-  md += `| **Investor** | ${investorName} |\n`;
   md += `| **Wallet** | \`${walletAddress}\` |\n`;
   md += `| **Generated** | ${timestamp} |\n`;
   md += `| **Platform** | ${report.platformUrl} |\n\n`;
@@ -711,11 +752,15 @@ async function main(): Promise<void> {
       );
     } catch (err) {
       log("WARN", `  Evaluation error: ${(err as Error).message}`);
+      const fallbackPrice = fromUsdcUnits(
+        (asset as Record<string, unknown>).sharePrice ??
+          (asset as Record<string, unknown>).pricePerShare
+      );
       decisions.push({
         asset,
         decision: "REJECT",
         shareCount: 0,
-        pricePerShare: String((asset as Record<string, unknown>).pricePerShare ?? "unknown"),
+        pricePerShare: fallbackPrice > 0 ? fallbackPrice.toFixed(2) : "unknown",
         totalCostUsdc: "0",
         reasoning: `Evaluation failed: ${(err as Error).message}`,
         metricsAssessed: {},
@@ -724,10 +769,13 @@ async function main(): Promise<void> {
       continue;
     }
 
-    const pricePerShare = String((asset as Record<string, unknown>).pricePerShare ?? "0");
-    const priceNum = parseFloat(pricePerShare) || 0;
-    const costNum = priceNum * evaluation.shareCount;
+    const pricePerShareUsdc = fromUsdcUnits(
+      (asset as Record<string, unknown>).sharePrice ??
+        (asset as Record<string, unknown>).pricePerShare
+    );
+    const costNum = pricePerShareUsdc * evaluation.shareCount;
     const totalCostUsdc = costNum.toFixed(2);
+    const pricePerShare = pricePerShareUsdc.toFixed(2);
 
     if (evaluation.decision === "PURCHASE" && evaluation.shareCount > 0) {
       plannedSharesTotal += evaluation.shareCount;
@@ -763,7 +811,6 @@ async function main(): Promise<void> {
 
   const plannedPurchases = decisions.filter((d) => d.decision === "PURCHASE");
   const report: AgentReport = {
-    investorName: CONFIG.investorName,
     walletAddress: signer.address,
     timestamp: new Date().toISOString(),
     criteria,
@@ -798,6 +845,8 @@ async function main(): Promise<void> {
 
   for (const d of decisions) {
     if (d.decision !== "PURCHASE" || d.shareCount === 0) continue;
+
+    await sleep(2000); // allow nonce to propagate before each purchase
 
     const label = assetDisplayName(d.asset);
     log("INFO", `Executing: ${label} (${d.shareCount} shares)`);

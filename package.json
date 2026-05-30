@@ -3,6 +3,8 @@
   "type": "module",
   "version": "1.0.0",
   "scripts": {
+    "start": "tsx src/run.ts",
+    "agent": "tsx src/agent.ts",
     "test": "echo \"Error: no test specified\" && exit 1"
   },
   "keywords": [],

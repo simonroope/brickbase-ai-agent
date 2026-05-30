@@ -40,16 +40,25 @@
  * ============================================================
  */
 
-import dotenv from "dotenv";
-import { GoogleGenAI, type Content } from "@google/genai";
-import { Client } from "@modelcontextprotocol/sdk/client/index.js";
-import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
-import { ethers } from "ethers";
 import * as fs from "fs/promises";
 import * as path from "path";
 import * as readline from "readline/promises";
+import { pathToFileURL } from "node:url";
+import type { GoogleGenAI, Content } from "@google/genai";
+import type { Client } from "@modelcontextprotocol/sdk/client/index.js";
+import type { JsonRpcProvider, Wallet } from "ethers";
 
-dotenv.config();
+/** Heavy deps are loaded lazily so startup logs appear before any import can hang. */
+let googleGenaiModule: typeof import("@google/genai") | undefined;
+let mcpClientModule: typeof import("@modelcontextprotocol/sdk/client/index.js") | undefined;
+let mcpTransportModule:
+  | typeof import("@modelcontextprotocol/sdk/client/streamableHttp.js")
+  | undefined;
+let ethersModule: typeof import("ethers") | undefined;
+
+console.log(
+  `[${new Date().toISOString()}] [>]  Agent module loaded — waiting for main()`
+);
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -148,21 +157,23 @@ interface AgentReport {
 /** USDC and share prices use 6 decimals on-chain */
 const USDC_DECIMALS = 6;
 
-const CONFIG = {
-  gemini: {
-    model: process.env.GEMINI_MODEL ?? "gemini-2.0-flash",
-    maxOutputTokens: 2048,
-    temperature: 0.4,
-  },
-  mcp: {
-    url: process.env.MCP_URL ?? "",
-  },
-  wallet: {
-    privateKey: process.env.AGENT_PRIVATE_KEY ?? "",
-    rpcUrl: process.env.RPC_URL ?? "http://localhost:8545",
-  },
-  reportDir: process.env.REPORT_DIR ?? "./reports",
-};
+function getConfig() {
+  return {
+    gemini: {
+      model: process.env.GEMINI_MODEL ?? "gemini-2.0-flash",
+      maxOutputTokens: 2048,
+      temperature: 0.4,
+    },
+    mcp: {
+      url: process.env.MCP_URL ?? "",
+    },
+    wallet: {
+      privateKey: process.env.AGENT_PRIVATE_KEY ?? "",
+      rpcUrl: process.env.RPC_URL ?? "http://localhost:8545",
+    },
+    reportDir: process.env.REPORT_DIR ?? "./reports",
+  };
+}
 
 // ─── Logging ──────────────────────────────────────────────────────────────────
 
@@ -181,13 +192,42 @@ function log(level: LogLevel, msg: string): void {
 const sleep = (ms: number): Promise<void> =>
   new Promise((r) => setTimeout(r, ms));
 
+async function waitMs(reason: string, ms: number): Promise<void> {
+  log("INFO", `Waiting ${ms}ms — ${reason}`);
+  await sleep(ms);
+}
+
+async function loadDependencies(): Promise<void> {
+  log("INFO", "Loading dotenv...");
+  const dotenv = await import("dotenv");
+  dotenv.config();
+
+  log("INFO", "Loading @google/genai...");
+  googleGenaiModule = await import("@google/genai");
+
+  log("INFO", "Loading MCP SDK...");
+  mcpClientModule = await import("@modelcontextprotocol/sdk/client/index.js");
+  mcpTransportModule = await import(
+    "@modelcontextprotocol/sdk/client/streamableHttp.js"
+  );
+
+  log("INFO", "Loading ethers...");
+  ethersModule = await import("ethers");
+
+  log("INFO", "Dependencies loaded");
+}
+
 // ─── Gemini ───────────────────────────────────────────────────────────────────
 
 function initGemini(): GoogleGenAI {
+  if (!googleGenaiModule) {
+    throw new Error("Dependencies not loaded. Call loadDependencies() first.");
+  }
   const apiKey = process.env.GOOGLE_API_KEY;
   if (!apiKey) throw new Error("GOOGLE_API_KEY is not set.");
-  log("INFO", `Gemini AI client ready (model: ${CONFIG.gemini.model})`);
-  return new GoogleGenAI({ apiKey });
+  const config = getConfig();
+  log("INFO", `Gemini AI client ready (model: ${config.gemini.model})`);
+  return new googleGenaiModule.GoogleGenAI({ apiKey });
 }
 
 async function geminiChat(
@@ -195,12 +235,13 @@ async function geminiChat(
   history: Content[],
   systemInstruction: string
 ): Promise<string> {
+  const config = getConfig();
   const response = await genAI.models.generateContent({
-    model: CONFIG.gemini.model,
+    model: config.gemini.model,
     contents: history,
     config: {
-      maxOutputTokens: CONFIG.gemini.maxOutputTokens,
-      temperature: CONFIG.gemini.temperature,
+      maxOutputTokens: config.gemini.maxOutputTokens,
+      temperature: config.gemini.temperature,
       systemInstruction,
     },
   });
@@ -231,7 +272,12 @@ async function geminiJSON<T>(
 // ─── MCP ──────────────────────────────────────────────────────────────────────
 
 async function connectMCP(url: string): Promise<Client> {
-  const client = new Client({
+  if (!mcpClientModule || !mcpTransportModule) {
+    throw new Error("Dependencies not loaded. Call loadDependencies() first.");
+  }
+  const { Client: McpClient } = mcpClientModule;
+  const { StreamableHTTPClientTransport } = mcpTransportModule;
+  const client = new McpClient({
     name: "rwa-investor-agent",
     version: "1.0.0",
   });
@@ -353,24 +399,28 @@ Return JSON with the exact names/URIs to use. Infer parameter names from inputSc
 // ─── Wallet ───────────────────────────────────────────────────────────────────
 
 function initWallet(): {
-  provider: ethers.JsonRpcProvider;
-  signer: ethers.Wallet;
+  provider: JsonRpcProvider;
+  signer: Wallet;
 } {
-  if (!CONFIG.wallet.privateKey)
+  if (!ethersModule) {
+    throw new Error("Dependencies not loaded. Call loadDependencies() first.");
+  }
+  const config = getConfig();
+  if (!config.wallet.privateKey)
     throw new Error("AGENT_PRIVATE_KEY is not set.");
-  const provider = new ethers.JsonRpcProvider(CONFIG.wallet.rpcUrl);
-  const signer = new ethers.Wallet(CONFIG.wallet.privateKey, provider);
+  const provider = new ethersModule.ethers.JsonRpcProvider(config.wallet.rpcUrl);
+  const signer = new ethersModule.ethers.Wallet(config.wallet.privateKey, provider);
   log("INFO", `Investor wallet: ${signer.address}`);
   return { provider, signer };
 }
 
 async function signAndBroadcast(
-  signer: ethers.Wallet,
+  signer: Wallet,
   payloads: Array<{ to: string; data: string; value?: string }>
 ): Promise<string[]> {
   const hashes: string[] = [];
   for (const [i, p] of payloads.entries()) {
-    await sleep(2000); // allow nonce to propagate on automining chains
+    await waitMs("nonce propagation before signing next tx", 2000);
     const nonce = await signer.getNonce("pending");
     log("INFO", `  Signing tx ${i + 1}/${payloads.length}  ->  ${p.to}`);
     const tx = await signer.sendTransaction({
@@ -381,6 +431,7 @@ async function signAndBroadcast(
       nonce,
     });
     log("INFO", `  Submitted: ${tx.hash}`);
+    log("INFO", `  Waiting for tx ${tx.hash} to be mined...`);
     const receipt = await tx.wait();
     if (receipt) {
       log("INFO", `  Receipt: blockNumber=${receipt.blockNumber} gasUsed=${receipt.gasUsed}`);
@@ -448,11 +499,13 @@ async function discoverCriteria(
   history.push({ role: "model", parts: [{ text: opening }] });
 
   while (!criteria) {
+    log("INFO", "Waiting for your input...");
     const userInput = await rl.question("You: ");
     if (!userInput.trim()) continue;
 
     history.push({ role: "user", parts: [{ text: userInput }] });
 
+    log("INFO", "Waiting for Gemini (criteria discovery)...");
     const reply = await geminiChat(genAI, history, CRITERIA_SYSTEM);
     history.push({ role: "model", parts: [{ text: reply }] });
 
@@ -477,7 +530,7 @@ async function discoverCriteria(
   if (!criteria) throw new Error("Failed to extract investment criteria.");
 
   criteria.platformUrl =
-    criteria.platformUrl ?? CONFIG.mcp.url;
+    criteria.platformUrl ?? getConfig().mcp.url;
   if (!criteria.platformUrl)
     throw new Error(
       "Platform URL is required. Set MCP_URL or provide it during the conversation."
@@ -551,7 +604,7 @@ async function fetchAllAssets(
       log("WARN", `  Could not fetch detail for ${idNumber}: ${(err as Error).message}`);
       details.push(asset as AssetDetail);
     }
-    await sleep(200);
+    await waitMs(`rate limit before fetching next asset detail (${idNumber})`, 200);
   }
   return details;
 }
@@ -601,7 +654,7 @@ Return JSON:
 
 async function executePurchase(
   client: Client,
-  signer: ethers.Wallet,
+  signer: Wallet,
   asset: AssetDetail,
   shareCount: number,
   caps: DiscoveredCapabilities
@@ -686,19 +739,23 @@ function buildMarkdownReport(report: AgentReport): string {
 }
 
 async function writeReport(report: AgentReport): Promise<string> {
-  await fs.mkdir(CONFIG.reportDir, { recursive: true });
+  const reportDir = getConfig().reportDir;
+  await fs.mkdir(reportDir, { recursive: true });
   const slug = new Date()
     .toISOString()
     .replace(/:/g, "-")
     .replace(/\..+/, "");
-  const filePath = path.join(CONFIG.reportDir, `report-${slug}.md`);
+  const filePath = path.join(reportDir, `report-${slug}.md`);
   await fs.writeFile(filePath, buildMarkdownReport(report), "utf8");
   return filePath;
 }
 
 // ─── Main ─────────────────────────────────────────────────────────────────────
 
-async function main(): Promise<void> {
+export async function main(): Promise<void> {
+  log("STEP", "Script started — RWA Investor Agent");
+  await loadDependencies();
+
   console.log("\n" + "=".repeat(70));
   console.log("  RWA Investor Agent");
   console.log("  Platform-agnostic • Discovers tools and resources via MCP");
@@ -744,6 +801,7 @@ async function main(): Promise<void> {
 
     let evaluation: EvaluationResult;
     try {
+      log("INFO", `Waiting for Gemini (evaluate ${label})...`);
       evaluation = await evaluateAsset(
         genAI,
         asset,
@@ -803,7 +861,7 @@ async function main(): Promise<void> {
       });
     }
 
-    await sleep(700);
+    await waitMs(`rate limit before evaluating next asset (${label})`, 700);
   }
 
   // Phase 4: Report (planned)
@@ -846,7 +904,7 @@ async function main(): Promise<void> {
   for (const d of decisions) {
     if (d.decision !== "PURCHASE" || d.shareCount === 0) continue;
 
-    await sleep(2000); // allow nonce to propagate before each purchase
+    await waitMs("nonce propagation before next purchase", 2000);
 
     const label = assetDisplayName(d.asset);
     log("INFO", `Executing: ${label} (${d.shareCount} shares)`);
@@ -899,7 +957,15 @@ process.on("SIGINT", () => {
   process.exit(0);
 });
 
-main().catch((err: unknown) => {
-  console.error("Fatal:", err);
-  process.exit(1);
-});
+function isDirectRun(): boolean {
+  const entry = process.argv[1];
+  if (!entry) return false;
+  return import.meta.url === pathToFileURL(path.resolve(entry)).href;
+}
+
+if (isDirectRun()) {
+  main().catch((err: unknown) => {
+    console.error("Fatal:", err);
+    process.exit(1);
+  });
+}

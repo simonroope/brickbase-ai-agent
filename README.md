@@ -48,6 +48,8 @@ cp .env.example .env
 ## Usage
 
 ```bash
+npm run agent
+or
 npx tsx src/agent.ts
 ```
 
